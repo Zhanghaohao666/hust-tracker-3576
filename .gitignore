@@ -1,0 +1,26 @@
+# 编译产物
+obj/
+mk/
+target/
+*.o
+*.d
+
+# 平台 SDK 和第三方库（太大，不适合放 git）
+RK3576_Glibc200_Libs/
+RK3576_ThirdLibs/
+
+# 预编译库
+src/libs/
+
+# 模型文件（通常很大）
+src/model/*.rknn
+
+# 编辑器/IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
