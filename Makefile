@@ -32,13 +32,16 @@ MK_DIR=$(SDK_ROOT)/mk
 
 AllDIRS := $(SDK_ROOT)
 AllDIRS += $(shell ls -R . | grep '^\./.*:$$' | awk '{gsub(":","");print}' | \
-					grep -v '^./src$$' | grep -v '^./src/' | grep -v '^./tools')
+                    grep -v '^./src$$' | grep -v '^./src/' | grep -v '^./tools')
 AllDIRS += $(shell ls -R ./src | grep '^\./.*:$$' | awk '{gsub(":","");print}')
 
 LDFLAGS += -lsample_comm -lrtsp -llog -lcommcore -lservo
 
-# 编译选项配置
+# ==========================================
+# 编译选项配置 (已添加 -O3 优化)
+# ==========================================
 CFLAGS += $(foreach dir, $(AllDIRS), -I$(dir))
+CFLAGS += -O3
 CFLAGSCXX := $(CFLAGS)
 
 SRC_C := $(foreach dir,$(AllDIRS),$(wildcard $(dir)/*.c))
@@ -81,7 +84,7 @@ clean:
 distclean:clean
 
 # $(TARGET): $(OBJ_C) $(OBJ_CXX)
-# 	$(CC) $(CFLAGS) $(CFLAGSCXX) -o $@ $^ $(LDFLAGS)
+#   $(CC) $(CFLAGS) $(CFLAGSCXX) -o $@ $^ $(LDFLAGS)
 $(TARGET): $(OBJ_C) $(OBJ_CXX)
 	$(CXX) $(CFLAGS) $(CFLAGSCXX) -o $@ $^ $(LDFLAGS)
 

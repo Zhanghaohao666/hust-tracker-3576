@@ -1,0 +1,51 @@
+# =============================================================================
+# Makefile.servo_demo —— 伺服控制独立测试程序
+# 用法:  make -f tools/Makefile.servo_demo
+# 输出:  target/servo_demo
+# =============================================================================
+
+SDK_ROOT := $(shell pwd)
+DEFAULT_PLATFORM ?= rk3576
+DEFAULT_GLIBCVersion ?= 200
+
+CORSS := aarch64-none-linux-gnu-
+CC := $(CORSS)gcc
+
+SUBMODULEDIR := RK3576_Glibc$(DEFAULT_GLIBCVersion)_Libs
+THIRDDIR := RK3576_ThirdLibs
+
+# 头文件搜索路径
+CFLAGS := -Wall -O2
+CFLAGS += $(foreach dir,$(shell find $(SUBMODULEDIR)/include -type d 2>/dev/null),-I$(dir))
+CFLAGS += $(foreach dir,$(shell find $(THIRDDIR)/include -type d 2>/dev/null),-I$(dir))
+
+# 库搜索路径
+LDFLAGS := $(foreach dir,$(shell find $(SUBMODULEDIR)/lib -type d 2>/dev/null),-L$(dir))
+LDFLAGS += $(foreach dir,$(shell find $(THIRDDIR)/lib -type d 2>/dev/null),-L$(dir))
+
+# 只链接 servo 相关的库，不需要 opencv / tracker / rknn
+LDFLAGS += -lservo -lcommcore -llog -lpthread -lm -ldl
+
+SRC := tools/servo_demo.c
+TARGET := target/servo_demo
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	@mkdir -p target
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	@echo ""
+	@echo "===== 编译完成 ====="
+	@echo "输出: $(TARGET)"
+	@echo ""
+	@echo "部署到板子后运行:"
+	@echo "  ./servo_demo center            # 归中测试"
+	@echo "  ./servo_demo angle -30 45      # 指定角度测试"
+	@echo "  ./servo_demo speed 200 0       # 速度控制跟踪 (单次3秒)"
+	@echo "  ./servo_demo speed_loop        # 持续速度跟踪 (Ctrl+C退出)"
+	@echo "  ./servo_demo all               # 依次运行全部测试"
+
+clean:
+	rm -f $(TARGET)

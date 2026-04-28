@@ -25,16 +25,12 @@ using namespace cv;
 #include <thread>
 #include <pthread.h>
 
-// =============================================================================
-// 【外部桥接】跟踪结果上报到 伺服 + TCP 客户端
-// 本文件只负责跟踪算法。所有 servo / TCP 细节封装在 tracker_bridge.{h,c}。
-// 仅通过下面 2 个简单函数与外界交互：
-//   - tracker_bridge_report()      每帧上报跟踪结果
-//   - tracker_bridge_on_track_lost() 跟踪丢失时通知
-// =============================================================================
-extern "C" {
-#include "tracker_bridge.h"
-}
+// extern "C" {
+// #include "servo_cmd.h"
+// #include "net/cmd_protocol.h"
+// #include "net/tcp_cmd_server.h"
+// extern int g_servo_ok;
+// }
 
 /******************************/
 // std::ostringstream oss_targets;
@@ -50,16 +46,11 @@ static cv::Mat photo_last;
 
 //*******SELECT_CONTROL_FLAG******/
 int select_flag = 2; // 0: By Velocity; 1: By XY; 2: By ID
-bool IS_TRACK = false;   // 默认不跟踪，等待客户端下发指令
+bool IS_TRACK = true;
 int yolo_num_id  = 0;
 int Coordinate_X = 1000;
 int Coordinate_Y = 500;
 pthread_mutex_t g_select_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// 客户端 UNLOCK 请求标志位：TCP 线程置位，跟踪线程下一帧消费并强制解锁 KCF
-// 必须用此机制：因为跟踪态(status==3)时 IS_TRACK 标志根本不会被检查，
-// 单独 set IS_TRACK=false 无法停止已经在跑的 KCF 跟踪。
-bool g_unlock_requested = false;
 
 //*******Yolo_template_args******/
 // YoloBox :  coordinates (pixel)
@@ -160,29 +151,13 @@ void processRGBData(unsigned char* pData, int width, int height){
     bool local_is_track;
     int local_yolo_num_id;
     int local_coord_x, local_coord_y;
-    bool local_unlock_req;
     pthread_mutex_lock(&g_select_mutex);
     local_select_flag = select_flag;
     local_is_track = IS_TRACK;
     local_yolo_num_id = yolo_num_id;
     local_coord_x = Coordinate_X;
     local_coord_y = Coordinate_Y;
-    local_unlock_req = g_unlock_requested;
-    g_unlock_requested = false;  // 消费一次性请求
     pthread_mutex_unlock(&g_select_mutex);
-
-    // 【客户端 UNLOCK 请求处理】
-    // 只有通过 Tracker_SetCmd(CMD_ID_UNLOCK) 才能强制让 KCF 退出跟踪态。
-    if (local_unlock_req && GLB_TrackerRes.nTrackerStatus == 3)
-    {
-        Tracker_Cmd nTrackerCMD;
-        memset(&nTrackerCMD, 0, sizeof(nTrackerCMD));
-        nTrackerCMD.nCmd = CMD_ID_UNLOCK;
-        nTrackerCMD.nLockMod = LOCK_MOD_MANUAL;
-        nTrackerCMD.nFrameId = nFrmCnt;
-        Tracker_SetCmd(nTrackerCMD);
-        printf("[INFO] Track unlocked by client request\n");
-    }
 
     if(GLB_TrackerRes.nTrackerStatus != 3 && nFrmCnt > track_frame_cnt && local_is_track)
     // if(GLB_TrackerRes.nTrackerStatus != 3 &&  IS_TRACK )
@@ -214,34 +189,27 @@ void processRGBData(unsigned char* pData, int width, int height){
             }
 
         }
-        else if (local_select_flag == 1) // By XY
+        else if (local_select_flag == 1) // By XY - 从配置文件动态读取坐标
         {
             sorted_box = getBoxByXY(local_coord_x, local_coord_y);
             if (sorted_box.x != -1) {
-                TRACK = true;
-                printf("[SEL] XY(%d,%d) -> box(%d,%d,%d,%d) id=%d\n",
-                       local_coord_x, local_coord_y,
-                       sorted_box.x, sorted_box.y, sorted_box.w, sorted_box.h, sorted_box.id);
-            } else {
-                TRACK = false;
-                printf("[SEL] XY(%d,%d) -> no match in %d boxes\n",
-                       local_coord_x, local_coord_y, (int)g_prev.size());
+                TRACK =  true;
+            }
+            else {
+                TRACK =  false;
             }
         }
-        else if (local_select_flag == 2) // By ID
+        else if (local_select_flag == 2) // By ID - 从配置文件动态读取ID
         {
-            sorted_box = getBoxById(local_yolo_num_id);
+
+            // sorted_box = getBoxById(local_yolo_num_id);
+            sorted_box = {500,500,200,200,1};
+
             if (sorted_box.x != -1) {
-                TRACK = true;
-                printf("[SEL] ID=%d -> box(%d,%d,%d,%d)\n",
-                       local_yolo_num_id, sorted_box.x, sorted_box.y, sorted_box.w, sorted_box.h);
-            } else {
-                TRACK = false;
-                printf("[SEL] ID=%d -> not found in %d boxes (ids:",
-                       local_yolo_num_id, (int)g_prev.size());
-                for (size_t i = 0; i < g_prev.size(); i++)
-                    printf(" %d", g_prev[i].id);
-                printf(")\n");
+                TRACK =  true;
+            }
+            else {
+                TRACK =  false;
             }
         }
         else
@@ -275,36 +243,43 @@ void processRGBData(unsigned char* pData, int width, int height){
 
             // === KCF 段错误防护 ===
             // libTrackerLib 的 KCF 在目标框周围提取子窗口做相关滤波
-            // 需确保 margin = dim*PAD+BUF < img/2，否则持续缩小直到满足
+            // 实际 padding 因子未知（预编译库），保守取 4.5x 以确保安全
             if (TRACK) {
-                const float KCF_PAD = 1.75f;
-                const float SAFE_BUF = 10.0f;
-                const float max_w = (img_width  * 0.5f - SAFE_BUF) / KCF_PAD;
-                const float max_h = (img_height * 0.5f - SAFE_BUF) / KCF_PAD;
+                const float KCF_MAX_DIM = 300.0f;  // 最大框尺寸
+                const float KCF_PAD = 1.75f;       // 保守每侧系数(4.5x sub-window)
+                const float SAFE_BUF = 20.0f;      // 额外安全边距
 
-                // 等比缩小到 margin 安全范围内
-                if (ww > max_w || hh > max_h) {
-                    float s = std::min(max_w / ww, max_h / hh);
+                // 1) 限制框尺寸：等比缩小到安全范围
+                if (ww > KCF_MAX_DIM || hh > KCF_MAX_DIM) {
+                    float s = std::min(KCF_MAX_DIM / ww, KCF_MAX_DIM / hh);
                     float cx = xx + ww * 0.5f;
                     float cy = yy + hh * 0.5f;
                     ww *= s;
                     hh *= s;
                     xx = cx - ww * 0.5f;
                     yy = cy - hh * 0.5f;
-                    printf("[INFO] KCF safety: box scaled to %dx%d\n", (int)ww, (int)hh);
+                    std::cout << "[INFO] KCF safety: box scaled to "
+                              << (int)ww << "x" << (int)hh << std::endl;
                 }
 
-                // 确保框中心距边缘有足够空间给 KCF padding
+                // 2) 确保框中心距边缘有足够空间给 KCF padding
                 float margin_x = ww * KCF_PAD + SAFE_BUF;
                 float margin_y = hh * KCF_PAD + SAFE_BUF;
-                float cx = xx + ww * 0.5f;
-                float cy = yy + hh * 0.5f;
-                if (cx < margin_x) cx = margin_x;
-                if (cy < margin_y) cy = margin_y;
-                if (cx > img_width - margin_x) cx = img_width - margin_x;
-                if (cy > img_height - margin_y) cy = img_height - margin_y;
-                xx = cx - ww * 0.5f;
-                yy = cy - hh * 0.5f;
+
+                // 若 margin 超过半幅面，说明框太大无法安全放置
+                if (margin_x >= img_width * 0.5f || margin_y >= img_height * 0.5f) {
+                    std::cout << "[WARN] KCF margin exceeds half image, skip!" << std::endl;
+                    TRACK = false;
+                } else {
+                    float cx = xx + ww * 0.5f;
+                    float cy = yy + hh * 0.5f;
+                    if (cx < margin_x) cx = margin_x;
+                    if (cy < margin_y) cy = margin_y;
+                    if (cx > img_width - margin_x) cx = img_width - margin_x;
+                    if (cy > img_height - margin_y) cy = img_height - margin_y;
+                    xx = cx - ww * 0.5f;
+                    yy = cy - hh * 0.5f;
+                }
             }
 
             if(TRACK) {
@@ -319,7 +294,7 @@ void processRGBData(unsigned char* pData, int width, int height){
             memset(&nTrackerCMD, 0, sizeof(nTrackerCMD));
             nTrackerCMD.nCmd = CMD_ID_LOCK; // 跟踪锁定目标
             nTrackerCMD.nLockMod = LOCK_MOD_MANUAL; // 手动锁定
-            nTrackerCMD.nTargetId = (unsigned short)sorted_box.id;
+            nTrackerCMD.nTargetId = (unsigned short)local_yolo_num_id;
             nTrackerCMD.nLock_x = (unsigned short)std::max(0.0f, std::min(xx, (float)(img_width - 1)));
             nTrackerCMD.nLock_y = (unsigned short)std::max(0.0f, std::min(yy, (float)(img_height - 1)));
             nTrackerCMD.nLock_w = (unsigned short)std::max(1.0f, std::min(ww, (float)img_width));
@@ -327,13 +302,7 @@ void processRGBData(unsigned char* pData, int width, int height){
             nTrackerCMD.nFrameId = nFrmCnt;
 
             Tracker_SetCmd(nTrackerCMD);
-            printf("Tracker_SetCmd LOCK id=%d box=(%d,%d,%d,%d)\n",
-                   sorted_box.id, (int)xx, (int)yy, (int)ww, (int)hh);
-
-            // 锁定指令已发，清除 IS_TRACK 防止下一帧重复锁定
-            pthread_mutex_lock(&g_select_mutex);
-            IS_TRACK = false;
-            pthread_mutex_unlock(&g_select_mutex);
+            printf("Tracker_SetCmd is %d \r\n",nTrackerCMD.nCmd);
 
             }  // end if(TRACK) - 边界检查后
         }
@@ -355,19 +324,33 @@ void processRGBData(unsigned char* pData, int width, int height){
     
     drawBoxesByStatus(inputMat);
 
-    // ---------------------------------------------------------------------
-    // 【外部桥接】上报当前帧跟踪结果
-    //   - 跟踪态(status==3) 时：内部会驱动伺服跟随目标
-    //   - 总是：把状态报文通过 TCP 推给客户端
-    // 具体行为见 tracker_bridge.c，本文件不关心。
-    // ---------------------------------------------------------------------
-    tracker_bridge_report(GLB_TrackerRes.nTrackerStatus,
-                          (int)GLB_TrackerRes.xmin, (int)GLB_TrackerRes.ymin,
-                          (int)GLB_TrackerRes.w,    (int)GLB_TrackerRes.h,
-                          width, height, ntargetnum);
+    // === Servo Vision Tracking: follow target when in TRACK state ===
+    if (GLB_TrackerRes.nTrackerStatus == 3) {
+        float cx = GLB_TrackerRes.xmin + GLB_TrackerRes.w / 2.0f;
+        float cy = GLB_TrackerRes.ymin + GLB_TrackerRes.h / 2.0f;
+        const float img_cx = width / 2.0f;
+        const float img_cy = height / 2.0f;
+        int16_t err_x = (int16_t)(cx - img_cx);
+        int16_t err_y = (int16_t)(cy - img_cy);
+    //     if (g_servo_ok)
+    //         servo_vision_track(err_x, err_y, 1, 0,
+    //                            (uint16_t)GLB_TrackerRes.w,
+    //                            (uint16_t)GLB_TrackerRes.h);
+    }
 
-    // 每帧把 YOLO 目标列表发给客户端（用于客户端双击选目标）
-    tracker_bridge_send_targets(GLB_Objects, ntargetnum);
+    // // === Send status report to TCP client ===
+    // {
+    //     status_report_t rpt;
+    //     rpt.tracker_status = (uint8_t)GLB_TrackerRes.nTrackerStatus;
+    //     rpt.track_x = (int16_t)GLB_TrackerRes.xmin;
+    //     rpt.track_y = (int16_t)GLB_TrackerRes.ymin;
+    //     rpt.track_w = (int16_t)GLB_TrackerRes.w;
+    //     rpt.track_h = (int16_t)GLB_TrackerRes.h;
+    //     rpt.yaw_angle = 0;
+    //     rpt.pitch_angle = 0;
+    //     rpt.target_count = (uint8_t)ntargetnum;
+    //     tcp_cmd_server_send_status(&rpt);
+    // }
 
     // =================================== 输出 ===================================
     // // 检测信息：
@@ -609,28 +592,21 @@ YoloBox getBoxById(int id) {
     return { -1, -1, -1, -1, -1 }; // 没找到
 }
 YoloBox getBoxByXY(float x, float y) {
-    // 1) 精确匹配：点击落在框内
     for (const auto& box : g_prev) {
-        if (x >= box.x && x <= box.x + box.w &&
-            y >= box.y && y <= box.y + box.h) {
-            return box;
+        float xmax = box.x + box.w;
+        float ymax = box.y + box.h;
+
+        // 判断点 (x, y) 是否在框内
+        if (x >= box.x && x <= xmax &&
+            y >= box.y && y <= ymax) {
+            return box;  // 找到后直接返回
         }
     }
-    // 2) 容差匹配：找距离点击位置最近的框中心（容差 200 像素）
-    float bestDist = 200.0f * 200.0f;
-    int bestIdx = -1;
-    for (int i = 0; i < (int)g_prev.size(); i++) {
-        float cx = g_prev[i].x + g_prev[i].w * 0.5f;
-        float cy = g_prev[i].y + g_prev[i].h * 0.5f;
-        float d = (cx - x) * (cx - x) + (cy - y) * (cy - y);
-        if (d < bestDist) {
-            bestDist = d;
-            bestIdx = i;
-        }
-    }
-    if (bestIdx >= 0) return g_prev[bestIdx];
+
+    // 没找到，返回一个“空框”
     return { -1, -1, -1, -1, -1 };
 }
+
 
 
 
@@ -684,10 +660,10 @@ static inline void drawBoxesByStatus(cv::Mat& inputMat)
         cv::Scalar(255, 0, 0)    // 蓝
     };
     const cv::Scalar oneColorDet = cv::Scalar(0, 255, 255);   // 黄：非 select_flag==0 的检测框
-    const cv::Scalar trackColor  = cv::Scalar(0, 255, 0);     // 纯绿：跟踪框
+    const cv::Scalar trackColor  = cv::Scalar(255, 255, 0);   // 青：跟踪框
 
     int detThick   = std::max(2, W / 640);
-    int trackThick = std::max(6, W / 320);  // 跟踪框加粗，1920宽时=6
+    int trackThick = std::max(4, W / 480);
 
     // ===================== 检测状态：nTrackerStatus == 2，用 g_prev，画 id =====================
     if (GLB_TrackerRes.nTrackerStatus == 2)
@@ -787,11 +763,9 @@ static inline void ResetAllStatesOnTrackLost(int cur_status, int frame_id, bool 
         IS_TRACK = false;
         pthread_mutex_unlock(&g_select_mutex);
 
-        // -----------------------------------------------------------------
-        // 【外部桥接】跟踪丢失：通知伺服归零停转
-        // 伺服细节封装在 tracker_bridge.c
-        // -----------------------------------------------------------------
-        tracker_bridge_on_track_lost();
+        // // Stop servo tracking when track is lost
+        // if (g_servo_ok)
+        //     servo_vision_track(0, 0, 0, 0, 0, 0);
     }
 
     // 更新 last_status

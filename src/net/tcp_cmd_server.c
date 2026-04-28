@@ -8,6 +8,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <sys/uio.h>
 
 static int g_server_fd = -1;
 static int g_client_fd = -1;
@@ -24,13 +25,13 @@ static void *client_handler(void *arg) {
     while (g_running) {
         cmd_header_t hdr;
         int n = recv(fd, &hdr, sizeof(hdr), MSG_WAITALL);
-        if (n <= 0) break;
+        if (n != (int)sizeof(hdr)) break;
         if (hdr.magic != CMD_MAGIC) continue;
         if (hdr.payload_len > sizeof(buf)) continue;
 
         if (hdr.payload_len > 0) {
             n = recv(fd, buf, hdr.payload_len, MSG_WAITALL);
-            if (n <= 0) break;
+            if (n != (int)hdr.payload_len) break;
         }
 
         if (g_callback) {
@@ -42,6 +43,12 @@ static void *client_handler(void *arg) {
     if (g_client_fd == fd) g_client_fd = -1;
     pthread_mutex_unlock(&g_client_mutex);
     close(fd);
+
+    printf("[TCP] Client disconnected, auto-unlock tracking\n");
+    if (g_callback) {
+        g_callback(CMD_TRACK_UNLOCK, NULL, 0);
+    }
+
     return NULL;
 }
 
@@ -59,7 +66,10 @@ static void *accept_loop(void *arg) {
                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
         pthread_mutex_lock(&g_client_mutex);
-        if (g_client_fd >= 0) close(g_client_fd);
+        if (g_client_fd >= 0) {
+            /* Shutdown 通知旧 client_handler 线程退出，而非直接 close */
+            shutdown(g_client_fd, SHUT_RDWR);
+        }
         g_client_fd = fd;
         pthread_mutex_unlock(&g_client_mutex);
 
@@ -124,14 +134,47 @@ void tcp_cmd_server_stop(void) {
 int tcp_cmd_server_send_status(const status_report_t *report) {
     pthread_mutex_lock(&g_client_mutex);
     int fd = g_client_fd;
-    pthread_mutex_unlock(&g_client_mutex);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        pthread_mutex_unlock(&g_client_mutex);
+        return -1;
+    }
 
     cmd_header_t hdr;
     hdr.magic = CMD_MAGIC;
     hdr.cmd_id = CMD_STATUS_REPORT;
     hdr.payload_len = sizeof(status_report_t);
-    send(fd, &hdr, sizeof(hdr), MSG_NOSIGNAL);
-    send(fd, report, sizeof(status_report_t), MSG_NOSIGNAL);
+    struct iovec iov[2];
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len  = sizeof(hdr);
+    iov[1].iov_base = (void *)report;
+    iov[1].iov_len  = sizeof(status_report_t);
+    writev(fd, iov, 2);
+    pthread_mutex_unlock(&g_client_mutex);
+    return 0;
+}
+
+int tcp_cmd_server_send_target_list(const target_info_t *targets, uint8_t count) {
+    pthread_mutex_lock(&g_client_mutex);
+    int fd = g_client_fd;
+    if (fd < 0) {
+        pthread_mutex_unlock(&g_client_mutex);
+        return -1;
+    }
+
+    if (count > MAX_TARGETS_PER_LIST) count = MAX_TARGETS_PER_LIST;
+
+    cmd_header_t hdr;
+    hdr.magic = CMD_MAGIC;
+    hdr.cmd_id = CMD_TARGET_LIST;
+    hdr.payload_len = 1 + count * sizeof(target_info_t);
+    struct iovec iov[3];
+    iov[0].iov_base = &hdr;
+    iov[0].iov_len  = sizeof(hdr);
+    iov[1].iov_base = &count;
+    iov[1].iov_len  = 1;
+    iov[2].iov_base = (void *)targets;
+    iov[2].iov_len  = count * sizeof(target_info_t);
+    writev(fd, iov, 3);
+    pthread_mutex_unlock(&g_client_mutex);
     return 0;
 }

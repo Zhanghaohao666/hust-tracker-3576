@@ -18,6 +18,7 @@
 
 /* Device -> Client */
 #define CMD_STATUS_REPORT   0x80
+#define CMD_TARGET_LIST     0x81
 
 #pragma pack(push, 1)
 
@@ -60,6 +61,17 @@ typedef struct {
     int16_t  pitch_angle;     /* 0.01 deg units */
     uint8_t  target_count;
 } status_report_t;
+
+/* Single target info for CMD_TARGET_LIST */
+typedef struct {
+    int16_t  x;
+    int16_t  y;
+    int16_t  w;
+    int16_t  h;
+    int32_t  id;
+} target_info_t;   /* 12 bytes */
+
+#define MAX_TARGETS_PER_LIST  32
 
 #pragma pack(pop)
 

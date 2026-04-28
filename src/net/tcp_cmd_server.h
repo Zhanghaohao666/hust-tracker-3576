@@ -19,6 +19,9 @@ void tcp_cmd_server_stop(void);
 /* Send a status report to the connected client. Thread-safe. */
 int tcp_cmd_server_send_status(const status_report_t *report);
 
+/* Send target list to the connected client. Thread-safe. */
+int tcp_cmd_server_send_target_list(const target_info_t *targets, uint8_t count);
+
 #ifdef __cplusplus
 }
 #endif

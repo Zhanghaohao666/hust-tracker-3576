@@ -685,6 +685,7 @@ typedef struct _rkMpiCtx {
 } SAMPLE_MPI_CTX_S;
 
 static bool quit = false;
+int g_servo_ok = 0; /* 1 if servo_proto_init succeeded; extern用于 tracker_bridge.c */
 static void sigterm_handler(int sig) {
 	fprintf(stderr, "signal %d\n", sig);
 	quit = true;
@@ -695,9 +696,18 @@ static void on_servo_rx(uint16_t msgid, uint8_t frame_type,
                         uint8_t *payload, uint8_t len, void *user) {
 	(void)user;
 	(void)frame_type;
-	(void)payload;
-	(void)len;
-	/* Attitude data available here if needed for status reports */
+
+	if (msgid == 0x0002 && len >= sizeof(servo_attitude_report_t)) {
+		servo_attitude_report_t *att = (servo_attitude_report_t *)payload;
+		/* 每 200 次(约 2 秒@100Hz)打一次诊断 */
+		static int att_cnt = 0;
+		if ((++att_cnt) % 200 == 0) {
+			printf("[GIMBAL] yaw=%.2f pitch=%.2f spd_yaw=%.2f spd_pitch=%.2f trk_off=(%d,%d)\n",
+			       att->yaw_angle * 0.01f, att->pitch_angle * 0.01f,
+			       att->yaw_speed * 0.01f, att->pitch_speed * 0.01f,
+			       att->track_offset_x, att->track_offset_y);
+		}
+	}
 }
 
 /* --- Shared state for remote commands (defined in runtracker.cpp) --- */
@@ -706,67 +716,82 @@ extern bool IS_TRACK;
 extern int yolo_num_id;
 extern int Coordinate_X;
 extern int Coordinate_Y;
+extern pthread_mutex_t g_select_mutex;
+extern bool g_unlock_requested;
 
 static void on_tcp_command(uint8_t cmd_id, const void *payload, uint16_t len) {
 	switch (cmd_id) {
 	case CMD_TRACK_XY: {
 		if (len < sizeof(cmd_track_xy_t)) break;
 		const cmd_track_xy_t *p = (const cmd_track_xy_t *)payload;
+		pthread_mutex_lock(&g_select_mutex);
 		select_flag = 1;
 		Coordinate_X = p->x;
 		Coordinate_Y = p->y;
 		IS_TRACK = true;
+		pthread_mutex_unlock(&g_select_mutex);
 		printf("[TCP] Track XY: (%d, %d)\n", p->x, p->y);
 		break;
 	}
 	case CMD_TRACK_ID: {
 		if (len < sizeof(cmd_track_id_t)) break;
 		const cmd_track_id_t *p = (const cmd_track_id_t *)payload;
+		pthread_mutex_lock(&g_select_mutex);
 		select_flag = 2;
 		yolo_num_id = p->target_id;
 		IS_TRACK = true;
+		pthread_mutex_unlock(&g_select_mutex);
 		printf("[TCP] Track ID: %d\n", p->target_id);
 		break;
 	}
 	case CMD_TRACK_UNLOCK: {
+		pthread_mutex_lock(&g_select_mutex);
 		IS_TRACK = false;
+		g_unlock_requested = true;  // 通知跟踪线程发 CMD_ID_UNLOCK 给 KCF
+		pthread_mutex_unlock(&g_select_mutex);
 		printf("[TCP] Track UNLOCK\n");
 		break;
 	}
 	case CMD_GIMBAL_CENTER: {
-		servo_gimbal_ctrl(
-			SERVO_GIMBAL_MODE_MAKE(SERVO_GIMBAL_WORK_CENTER, SERVO_GIMBAL_FUNC_NONE),
-			128, 128);
+		if (g_servo_ok) {
+			servo_gimbal_ctrl(
+				SERVO_GIMBAL_MODE_MAKE(SERVO_GIMBAL_WORK_CENTER, SERVO_GIMBAL_FUNC_NONE),
+				128, 128);
+		}
 		printf("[TCP] Gimbal CENTER\n");
 		break;
 	}
 	case CMD_GIMBAL_DOWN90: {
-		servo_gimbal_ctrl(
-			SERVO_GIMBAL_MODE_MAKE(SERVO_GIMBAL_WORK_DOWN_90, SERVO_GIMBAL_FUNC_NONE),
-			128, 128);
+		if (g_servo_ok)
+			servo_gimbal_ctrl(
+				SERVO_GIMBAL_MODE_MAKE(SERVO_GIMBAL_WORK_DOWN_90, SERVO_GIMBAL_FUNC_NONE),
+				128, 128);
 		printf("[TCP] Gimbal DOWN 90\n");
 		break;
 	}
 	case CMD_GIMBAL_SET_ANGLE: {
 		if (len < sizeof(cmd_gimbal_angle_t)) break;
 		const cmd_gimbal_angle_t *p = (const cmd_gimbal_angle_t *)payload;
-		servo_set_angle(p->pitch_deg, p->yaw_deg, 0);
+		if (g_servo_ok)
+			servo_set_angle(p->pitch_deg, p->yaw_deg, 0);
 		printf("[TCP] Gimbal angle: pitch=%d yaw=%d\n", p->pitch_deg, p->yaw_deg);
 		break;
 	}
 	case CMD_GIMBAL_SPEED: {
 		if (len < sizeof(cmd_gimbal_speed_t)) break;
 		const cmd_gimbal_speed_t *p = (const cmd_gimbal_speed_t *)payload;
-		servo_gimbal_ctrl(
-			SERVO_GIMBAL_MODE_MAKE(SERVO_GIMBAL_WORK_NONE, SERVO_GIMBAL_FUNC_NONE),
-			p->yaw_speed, p->pitch_speed);
+		if (g_servo_ok)
+			servo_gimbal_ctrl(
+				SERVO_GIMBAL_MODE_MAKE(SERVO_GIMBAL_WORK_NONE, SERVO_GIMBAL_FUNC_NONE),
+				p->yaw_speed, p->pitch_speed);
 		printf("[TCP] Gimbal speed: yaw=%u pitch=%u\n", p->yaw_speed, p->pitch_speed);
 		break;
 	}
 	case CMD_GIMBAL_LOCK: {
 		if (len < sizeof(cmd_gimbal_lock_t)) break;
 		const cmd_gimbal_lock_t *p = (const cmd_gimbal_lock_t *)payload;
-		servo_set_lock_mode(p->mode);
+		if (g_servo_ok)
+			servo_set_lock_mode(p->mode);
 		printf("[TCP] Gimbal lock: %u\n", p->mode);
 		break;
 	}
@@ -869,8 +894,8 @@ static void *GetMediaBuffer0(void *arg) {
 			//手动的进行地址转换
 			len=SAMPLE_COMM_VPSS_Frame(&ctx->vpss,&pData);
 			processRGBData((unsigned char*)pData, process_video_width, process_video_height);
-			// printf("------------> Len : %d\n",len);
-			// RK_MPI_VO_SendFrame(VoLayer, VoChn, &stViFrame, waitTime);
+			// 画框后刷新 CPU 缓存到物理内存，否则 VENC 通过 DMA 读不到 CPU 画的框
+			RK_MPI_SYS_MmzFlushCache(ctx->vpss.stChnFrameInfos.stVFrame.pMbBlk, RK_FALSE);
 			RK_MPI_VENC_SendFrame(ctx->venc.s32ChnId,&ctx->vpss.stChnFrameInfos,-1);
 			// 7.release the frame
 			// s32Ret = SAMPLE_COMM_VPSS_ReleaseChnFrame(ctx);
@@ -979,6 +1004,7 @@ int main(int argc, char *argv[]) {
 	memset(ctx, 0, sizeof(SAMPLE_MPI_CTX_S));
 
 	signal(SIGINT, sigterm_handler);
+	signal(SIGPIPE, SIG_IGN);
 
 #ifdef RKAIQ
 	RK_BOOL bMultictx = RK_FALSE;
@@ -1119,10 +1145,21 @@ int main(int argc, char *argv[]) {
 	// Init servo communication
 	if (servo_proto_init(NULL) != 0) {
 		printf("servo_proto_init failed, continuing without servo\n");
+		g_servo_ok = 0;
 	} else {
 		servo_proto_register_cb(on_servo_rx, NULL);
 		servo_get_version();
-		printf("Servo initialized OK\n");
+		usleep(100000); /* 100ms: 等待版本查询完成 */
+
+		/* 确保云台不在锁定模式 */
+		servo_set_lock_mode(SERVO_LOCK_MODE_EXIT);
+		usleep(50000);
+		/* 最大拨轮速度拉满 (范围 5~100) */
+		servo_set_max_wheel_speed(100, 100);
+		usleep(50000);
+		printf("Servo init OK: lock=EXIT, wheel_speed=100\n");
+
+		g_servo_ok = 1;
 	}
 
 	// Start TCP command server
@@ -1335,7 +1372,8 @@ int main(int argc, char *argv[]) {
 
 	// Cleanup servo and TCP server
 	tcp_cmd_server_stop();
-	servo_proto_deinit();
+	if (g_servo_ok)
+		servo_proto_deinit();
 
 __FAILED:
 	RK_MPI_SYS_Exit();
