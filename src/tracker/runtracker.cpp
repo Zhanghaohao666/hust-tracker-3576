@@ -294,17 +294,11 @@ void processRGBData(unsigned char* pData, int width, int height){
                     printf("[INFO] KCF safety: box scaled to %dx%d\n", (int)ww, (int)hh);
                 }
 
-                // 确保框中心距边缘有足够空间给 KCF padding
-                float margin_x = ww * KCF_PAD + SAFE_BUF;
-                float margin_y = hh * KCF_PAD + SAFE_BUF;
-                float cx = xx + ww * 0.5f;
-                float cy = yy + hh * 0.5f;
-                if (cx < margin_x) cx = margin_x;
-                if (cy < margin_y) cy = margin_y;
-                if (cx > img_width - margin_x) cx = img_width - margin_x;
-                if (cy > img_height - margin_y) cy = img_height - margin_y;
-                xx = cx - ww * 0.5f;
-                yy = cy - hh * 0.5f;
+                // 再次边界裁剪（缩放可能改变了位置）
+                if (xx < 0) { ww += xx; xx = 0; }
+                if (yy < 0) { hh += yy; yy = 0; }
+                if (xx + ww > img_width) ww = img_width - xx;
+                if (yy + hh > img_height) hh = img_height - yy;
             }
 
             if(TRACK) {

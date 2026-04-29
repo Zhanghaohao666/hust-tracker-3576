@@ -18,6 +18,11 @@
 extern int g_servo_ok;
 
 static int s_servo_tracking = 0;
+static int s_hold_counter = 0;
+
+/* 跟踪丢失后保持伺服位置的帧数（30fps × 3秒 = 90帧）
+ * 防止短暂丢失（如 RECAP 状态切换）导致伺服解锁、云台下坠 */
+#define SERVO_HOLD_FRAMES 90
 
 void tracker_bridge_report(int tracker_status,
                            int xmin, int ymin, int w, int h,
@@ -35,9 +40,15 @@ void tracker_bridge_report(int tracker_status,
                                (uint16_t)w, (uint16_t)h);
         }
         s_servo_tracking = 1;
-    } else {
-        /* 退出跟踪态: en=0(解锁), flag=0 */
-        if (s_servo_tracking && g_servo_ok) {
+        s_hold_counter = 0;
+    } else if (s_servo_tracking && g_servo_ok) {
+        /* 刚退出跟踪态：不立即解锁，先保持位置 */
+        s_hold_counter++;
+        if (s_hold_counter <= SERVO_HOLD_FRAMES) {
+            /* 保持：en=2(跟踪态) flag=0(目标丢失)，伺服保持当前位置 */
+            servo_vision_track(0, 0, 2, 0, 0, 0);
+        } else {
+            /* 超时：真正解锁 */
             servo_vision_track(0, 0, 0, 0, 0, 0);
             s_servo_tracking = 0;
         }
@@ -58,9 +69,12 @@ void tracker_bridge_report(int tracker_status,
 
 void tracker_bridge_on_track_lost(void)
 {
-    if (g_servo_ok && s_servo_tracking) {
-        servo_vision_track(0, 0, 0, 0, 0, 0);
-        s_servo_tracking = 0;
+    /* 不立即解锁伺服，由 tracker_bridge_report() 的保持逻辑
+     * 渐进处理（先保持位置 SERVO_HOLD_FRAMES 帧后再解锁）。
+     * 这里只需确保 hold 计数器开始计时。 */
+    if (g_servo_ok && s_servo_tracking && s_hold_counter == 0) {
+        s_hold_counter = 1;
+        servo_vision_track(0, 0, 2, 0, 0, 0);
     }
 }
 
