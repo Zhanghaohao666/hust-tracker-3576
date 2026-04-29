@@ -32,7 +32,7 @@ void tracker_bridge_report(int tracker_status,
     /* ---- 1) 跟踪态：用伺服原生视觉跟踪接口 ---- */
     if (tracker_status == 3) {
         int16_t err_x = -(int16_t)((float)xmin + (float)w * 0.5f - (float)img_w * 0.5f);
-        int16_t err_y = -(int16_t)((float)ymin + (float)h * 0.5f - (float)img_h * 0.5f);
+        int16_t err_y =  (int16_t)((float)ymin + (float)h * 0.5f - (float)img_h * 0.5f);
 
         if (g_servo_ok) {
             /* en=2: 跟踪状态, flag=1: 跟踪成功 */
