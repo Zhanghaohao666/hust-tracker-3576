@@ -718,6 +718,7 @@ extern int Coordinate_X;
 extern int Coordinate_Y;
 extern pthread_mutex_t g_select_mutex;
 extern bool g_unlock_requested;
+extern bool g_manual_unlock;
 
 static void on_tcp_command(uint8_t cmd_id, const void *payload, uint16_t len) {
 	switch (cmd_id) {
@@ -748,6 +749,7 @@ static void on_tcp_command(uint8_t cmd_id, const void *payload, uint16_t len) {
 		pthread_mutex_lock(&g_select_mutex);
 		IS_TRACK = false;
 		g_unlock_requested = true;  // 通知跟踪线程发 CMD_ID_UNLOCK 给 KCF
+		g_manual_unlock = true;     // 标记为主动解锁，让 tracker_bridge 立即停止伺服
 		pthread_mutex_unlock(&g_select_mutex);
 		printf("[TCP] Track UNLOCK\n");
 		break;

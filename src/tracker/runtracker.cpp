@@ -61,6 +61,9 @@ pthread_mutex_t g_select_mutex = PTHREAD_MUTEX_INITIALIZER;
 // 单独 set IS_TRACK=false 无法停止已经在跑的 KCF 跟踪。
 bool g_unlock_requested = false;
 
+// 主动解锁标志：用于 tracker_bridge 区分主动解锁和跟踪丢失
+bool g_manual_unlock = false;
+
 //*******Yolo_template_args******/
 // YoloBox :  coordinates (pixel)
 static std::vector<YoloBox> g_prev;
@@ -258,48 +261,15 @@ void processRGBData(unsigned char* pData, int width, int height){
             float ww = sorted_box.w;
             float hh = sorted_box.h;
 
-            // 边界裁剪：确保跟踪框不超出图像边界 (1920x1080)
+            // 边界裁剪：仅确保跟踪框不超出图像边界 (1920x1080)
+            // 仅做边界裁剪，不再对目标框宽高做额外缩小。
             const int img_width = 1920;
             const int img_height = 1080;
-            
+
             if (xx < 0) { ww += xx; xx = 0; }
             if (yy < 0) { hh += yy; yy = 0; }
             if (xx + ww > img_width) ww = img_width - xx;
             if (yy + hh > img_height) hh = img_height - yy;
-            
-            // 检查裁剪后框是否有效
-            if (ww <= 20 || hh <= 20) {
-                std::cout << "[WARN] Box too small or invalid after clamping, skip tracking!" << std::endl;
-                TRACK = false;
-            }
-
-            // === KCF 段错误防护 ===
-            // libTrackerLib 的 KCF 在目标框周围提取子窗口做相关滤波
-            // 需确保 margin = dim*PAD+BUF < img/2，否则持续缩小直到满足
-            if (TRACK) {
-                const float KCF_PAD = 1.75f;
-                const float SAFE_BUF = 10.0f;
-                const float max_w = (img_width  * 0.5f - SAFE_BUF) / KCF_PAD;
-                const float max_h = (img_height * 0.5f - SAFE_BUF) / KCF_PAD;
-
-                // 等比缩小到 margin 安全范围内
-                if (ww > max_w || hh > max_h) {
-                    float s = std::min(max_w / ww, max_h / hh);
-                    float cx = xx + ww * 0.5f;
-                    float cy = yy + hh * 0.5f;
-                    ww *= s;
-                    hh *= s;
-                    xx = cx - ww * 0.5f;
-                    yy = cy - hh * 0.5f;
-                    printf("[INFO] KCF safety: box scaled to %dx%d\n", (int)ww, (int)hh);
-                }
-
-                // 再次边界裁剪（缩放可能改变了位置）
-                if (xx < 0) { ww += xx; xx = 0; }
-                if (yy < 0) { hh += yy; yy = 0; }
-                if (xx + ww > img_width) ww = img_width - xx;
-                if (yy + hh > img_height) hh = img_height - yy;
-            }
 
             if(TRACK) {
             std::cout << "======================================="
@@ -738,7 +708,7 @@ static inline void drawBoxesByStatus(cv::Mat& inputMat)
         cv::rectangle(inputMat, r, trackColor, trackThick, cv::LINE_8);
 
 
-        // std::this_thread::sleep_for(std::chrono::milliseconds(0));
+        // std::this_thread::sleep_for(std::chrono::milliseconds(100));
         
 
 

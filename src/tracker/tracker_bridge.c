@@ -9,6 +9,7 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <math.h>
 #include "servo_cmd.h"
 #include "net/cmd_protocol.h"
@@ -17,12 +18,15 @@
 /* 伺服初始化是否成功，由 sample_huake.c 维护 */
 extern int g_servo_ok;
 
-static int s_servo_tracking = 0;
-static int s_hold_counter = 0;
+/* 主动解锁标志：TCP 线程置位，跟踪线程消费 */
+extern bool g_manual_unlock;
 
-/* 跟踪丢失后保持伺服位置的帧数（30fps × 3秒 = 90帧）
- * 防止短暂丢失（如 RECAP 状态切换）导致伺服解锁、云台下坠 */
-#define SERVO_HOLD_FRAMES 90
+static int s_servo_tracking = 0;
+
+/* 跟踪启动时的最大偏差限幅（像素）
+ * 防止目标偏离中心太远时伺服猛转导致跟踪丢失 */
+#define MAX_ERR_X 150
+#define MAX_ERR_Y 100
 
 void tracker_bridge_report(int tracker_status,
                            int xmin, int ymin, int w, int h,
@@ -34,24 +38,22 @@ void tracker_bridge_report(int tracker_status,
         int16_t err_x = -(int16_t)((float)xmin + (float)w * 0.5f - (float)img_w * 0.5f);
         int16_t err_y =  (int16_t)((float)ymin + (float)h * 0.5f - (float)img_h * 0.5f);
 
+        /* 限幅：防止偏差过大导致伺服猛转 */
+        if (err_x > MAX_ERR_X) err_x = MAX_ERR_X;
+        if (err_x < -MAX_ERR_X) err_x = -MAX_ERR_X;
+        if (err_y > MAX_ERR_Y) err_y = MAX_ERR_Y;
+        if (err_y < -MAX_ERR_Y) err_y = -MAX_ERR_Y;
+
         if (g_servo_ok) {
             /* en=2: 跟踪状态, flag=1: 跟踪成功 */
             servo_vision_track(err_x, err_y, 2, 1,
                                (uint16_t)w, (uint16_t)h);
         }
         s_servo_tracking = 1;
-        s_hold_counter = 0;
     } else if (s_servo_tracking && g_servo_ok) {
-        /* 刚退出跟踪态：不立即解锁，先保持位置 */
-        s_hold_counter++;
-        if (s_hold_counter <= SERVO_HOLD_FRAMES) {
-            /* 保持：en=2(跟踪态) flag=0(目标丢失)，伺服保持当前位置 */
-            servo_vision_track(0, 0, 2, 0, 0, 0);
-        } else {
-            /* 超时：真正解锁 */
-            servo_vision_track(0, 0, 0, 0, 0, 0);
-            s_servo_tracking = 0;
-        }
+        /* 退出跟踪态：立即解锁伺服 */
+        servo_vision_track(0, 0, 0, 0, 0, 0);
+        s_servo_tracking = 0;
     }
 
     /* ---- 2) 把当前状态打包成报文，发给客户端 ---- */
@@ -69,13 +71,15 @@ void tracker_bridge_report(int tracker_status,
 
 void tracker_bridge_on_track_lost(void)
 {
-    /* 不立即解锁伺服，由 tracker_bridge_report() 的保持逻辑
-     * 渐进处理（先保持位置 SERVO_HOLD_FRAMES 帧后再解锁）。
-     * 这里只需确保 hold 计数器开始计时。 */
-    if (g_servo_ok && s_servo_tracking && s_hold_counter == 0) {
-        s_hold_counter = 1;
-        servo_vision_track(0, 0, 2, 0, 0, 0);
+    /* 主动解锁：立即停止伺服 */
+    if (g_manual_unlock) {
+        if (g_servo_ok && s_servo_tracking) {
+            servo_vision_track(0, 0, 0, 0, 0, 0);
+            s_servo_tracking = 0;
+        }
+        g_manual_unlock = false;  // 消费一次性请求
     }
+    /* 跟踪丢失：由 tracker_bridge_report() 处理 */
 }
 
 void tracker_bridge_send_targets(const void *objects, int count)
